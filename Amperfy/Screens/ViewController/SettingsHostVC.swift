@@ -90,6 +90,15 @@ class SettingsHostVC: UIViewController {
     if !isForOwnWindow {
       extendSafeAreaToAccountForMiniPlayer()
     }
+    
+    // Setup Bluetooth communication service with player and storage
+    // This ensures Bluetooth stays connected even when leaving settings
+    Task { @MainActor in
+      BluetoothManager.shared.setupCommunication(
+        player: appDelegate.player,
+        storage: appDelegate.storage.main.library
+      )
+    }
 
     settings.isOfflineMode = appDelegate.storage.settings.user.isOfflineMode
     changesAgent.append(settings.$isOfflineMode.sink(receiveValue: { newValue in

@@ -22,6 +22,8 @@
 import CoreBluetooth
 import Foundation
 import os.log
+import AmperfyKit
+import UIKit
 
 // MARK: - BluetoothDevice
 
@@ -51,6 +53,8 @@ class BluetoothDevice: Identifiable, ObservableObject {
 /// Manages Bluetooth Low Energy scanning and connections
 @MainActor
 class BluetoothManager: NSObject, ObservableObject {
+  static let shared = BluetoothManager()
+  
   private var centralManager: CBCentralManager!
   
   @Published var isScanning = false
@@ -61,9 +65,88 @@ class BluetoothManager: NSObject, ObservableObject {
   
   private let logger = Logger(subsystem: "io.github.amperfy", category: "Bluetooth")
   
-  override init() {
+  // Communication service
+  let communicationService = BluetoothCommunicationService()
+  
+  // Player observer
+  let playerObserver = BluetoothPlayerObserver()
+  
+  // Persistent storage keys
+  private let lastConnectedDeviceUUIDKey = "LastConnectedBluetoothDeviceUUID"
+  private let lastConnectedDeviceNameKey = "LastConnectedBluetoothDeviceName"
+  private let shouldAutoReconnectKey = "BluetoothShouldAutoReconnect"
+  
+  private var hasAttemptedAutoReconnect = false
+  
+  private override init() {
     super.init()
     centralManager = CBCentralManager(delegate: self, queue: .main)
+  }
+  
+  // MARK: - Persistent Storage
+  
+  private func saveConnectedDevice(_ device: BluetoothDevice) {
+    UserDefaults.standard.set(device.id.uuidString, forKey: lastConnectedDeviceUUIDKey)
+    UserDefaults.standard.set(device.name, forKey: lastConnectedDeviceNameKey)
+    UserDefaults.standard.set(true, forKey: shouldAutoReconnectKey)
+    logger.info("Saved device to persistent storage: \(device.name) (\(device.id.uuidString))")
+  }
+  
+  private func clearConnectedDevice() {
+    UserDefaults.standard.removeObject(forKey: lastConnectedDeviceUUIDKey)
+    UserDefaults.standard.removeObject(forKey: lastConnectedDeviceNameKey)
+    UserDefaults.standard.set(false, forKey: shouldAutoReconnectKey)
+    logger.info("Cleared saved device from persistent storage")
+  }
+  
+  private func getLastConnectedDeviceUUID() -> UUID? {
+    guard let uuidString = UserDefaults.standard.string(forKey: lastConnectedDeviceUUIDKey),
+          let uuid = UUID(uuidString: uuidString) else {
+      return nil
+    }
+    return uuid
+  }
+  
+  private func shouldAutoReconnect() -> Bool {
+    return UserDefaults.standard.bool(forKey: shouldAutoReconnectKey)
+  }
+  
+  /// Attempts to reconnect to the last connected device
+  func attemptAutoReconnect() {
+    guard !hasAttemptedAutoReconnect else {
+      logger.debug("Auto-reconnect already attempted")
+      return
+    }
+    
+    hasAttemptedAutoReconnect = true
+    
+    guard shouldAutoReconnect(),
+          let lastDeviceUUID = getLastConnectedDeviceUUID() else {
+      logger.info("No saved device to reconnect to")
+      return
+    }
+    
+    guard centralManager.state == .poweredOn else {
+      logger.warning("Cannot auto-reconnect: Bluetooth not powered on")
+      return
+    }
+    
+    logger.info("Attempting to reconnect to saved device: \(lastDeviceUUID.uuidString)")
+    
+    // Retrieve the peripheral from Core Bluetooth
+    let peripherals = centralManager.retrievePeripherals(withIdentifiers: [lastDeviceUUID])
+    
+    guard let peripheral = peripherals.first else {
+      logger.warning("Could not retrieve saved peripheral")
+      return
+    }
+    
+    // Create a device object and attempt connection
+    let device = BluetoothDevice(peripheral: peripheral, rssi: 0)
+    discoveredDevices.append(device)
+    
+    centralManager.connect(peripheral, options: nil)
+    logger.info("Initiated reconnection to: \(peripheral.name ?? "Unknown")")
   }
   
   // MARK: - Public Methods
@@ -96,8 +179,28 @@ class BluetoothManager: NSObject, ObservableObject {
   
   func disconnect() {
     guard let device = connectedDevice else { return }
+    
+    // Clear the saved device so we don't auto-reconnect
+    clearConnectedDevice()
+    
     centralManager.cancelPeripheralConnection(device.peripheral)
     logger.info("Disconnecting from device: \(device.name)")
+  }
+  
+  // MARK: - Communication Service Integration
+  
+  func setupCommunication(player: PlayerFacade, storage: LibraryStorage) {
+    communicationService.player = player
+    communicationService.storage = storage
+    playerObserver.startObserving(player: player, communicationService: communicationService)
+    logger.info("Communication service configured with player and storage")
+  }
+  
+  func teardownCommunication() {
+    playerObserver.stopObserving()
+    communicationService.player = nil
+    communicationService.storage = nil
+    logger.info("Communication service torn down")
   }
   
   // MARK: - Private Methods
@@ -118,6 +221,10 @@ extension BluetoothManager: CBCentralManagerDelegate {
         isBluetoothEnabled = true
         errorMessage = nil
         logger.info("Bluetooth powered on")
+        
+        // Attempt auto-reconnect when Bluetooth becomes available
+        attemptAutoReconnect()
+        
       case .poweredOff:
         isBluetoothEnabled = false
         errorMessage = "Bluetooth is turned off"
@@ -165,6 +272,24 @@ extension BluetoothManager: CBCentralManagerDelegate {
       if let device = discoveredDevices.first(where: { $0.peripheral.identifier == peripheralID }) {
         device.isConnected = true
         connectedDevice = device
+
+        // Save the connected device for auto-reconnect
+        saveConnectedDevice(device)
+
+        // Ensure communication service is set up with player and storage
+        // This is critical for handling queries from the device
+        if communicationService.storage == nil {
+          if let appDelegate = UIApplication.shared.delegate as? AppDelegate {
+            communicationService.player = appDelegate.player
+            communicationService.storage = appDelegate.storage.main.library
+            playerObserver.startObserving(player: appDelegate.player, communicationService: communicationService)
+            logger.info("Auto-configured communication service on connect")
+          } else {
+            logger.warning("Could not auto-configure communication service - AppDelegate not available")
+          }
+        }
+
+        communicationService.didConnectToPeripheral(device.peripheral)
         logger.info("Connected to device: \(device.name)")
       }
     }
@@ -181,13 +306,30 @@ extension BluetoothManager: CBCentralManagerDelegate {
   
   nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
     let peripheralID = peripheral.identifier
+    let hadError = error != nil
+    
     Task { @MainActor in
       if let device = discoveredDevices.first(where: { $0.peripheral.identifier == peripheralID }) {
         device.isConnected = false
         if connectedDevice?.id == device.id {
           connectedDevice = nil
         }
-        logger.info("Disconnected from device: \(device.name)")
+        communicationService.didDisconnectFromPeripheral()
+        
+        if hadError, shouldAutoReconnect() {
+          // Unexpected disconnection - try to reconnect
+          logger.warning("Unexpected disconnection from device: \(device.name). Attempting to reconnect...")
+          
+          // Wait a moment before attempting reconnection
+          Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2))
+            if self.centralManager.state == .poweredOn {
+              self.centralManager.connect(device.peripheral, options: nil)
+            }
+          }
+        } else {
+          logger.info("Disconnected from device: \(device.name)")
+        }
       }
     }
   }

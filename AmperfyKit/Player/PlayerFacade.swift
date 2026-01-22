@@ -151,7 +151,7 @@ public struct PlayContext {
 // MARK: - PlayerFacade
 
 @MainActor
-public protocol PlayerFacade {
+public protocol PlayerFacade: AnyObject {
   var prevQueueCount: Int { get }
   func getPrevQueueItems(from: Int, to: Int?) -> [AbstractPlayable]
   func getAllPrevQueueItems() -> [AbstractPlayable]

@@ -25,7 +25,7 @@ import SwiftUI
 // MARK: - BluetoothSettingsView
 
 struct BluetoothSettingsView: View {
-  @StateObject private var bluetoothManager = BluetoothManager()
+  @ObservedObject private var bluetoothManager = BluetoothManager.shared
   
   var body: some View {
     SettingsList {
